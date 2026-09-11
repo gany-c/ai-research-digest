@@ -1,6 +1,6 @@
 # AI Research Digest
 
-`ai-research-digest` collects the two newest entries from six AI and technology RSS feeds, asks a model running locally through Ollama to synthesize a concise technical briefing, and writes a dated dark-mode HTML dashboard to your Desktop. Every item retains its direct source link. Research papers include their RSS abstract, a plain-English explanation, and glossary definitions. No OpenAI API key or cloud-model account is required.
+`ai-research-digest` collects recent AI news, papers, and Hugging Face model updates, asks a model running locally through Ollama to synthesize a concise technical briefing, and writes a dated dark-mode HTML dashboard to your Desktop. Every item retains its direct source link. Research papers include their RSS abstract, a plain-English explanation, and glossary definitions. No OpenAI API key or cloud-model account is required.
 
 ## Sources
 
@@ -10,8 +10,16 @@
 - Wired AI
 - Slashdot
 - arXiv `cs.AI`
+- Hugging Face News
+- Hugging Face trending models (from the public Hub API and model cards)
 
-An unavailable or malformed feed is logged and skipped; the other feeds continue processing.
+For each source, the digest ranks eligible items using engagement metadata exposed by that source—such as reactions, comments, likes, downloads, or trending score—and uses publication recency as the fallback. It then selects up to two items that have not appeared during the preceding seven calendar days. The Hugging Face section gives a short explanation of each selected model and includes benchmark or evaluation details only when the model card supplies them; a trending score is treated as a popularity signal, not an accuracy ranking. An unavailable or malformed source is logged and skipped while the other sources continue processing.
+
+## Seven-day history
+
+Successful runs record canonical source URLs in `.digest_history.json`. Links recorded today remain eligible, so regenerating today's report produces the best current selection even if it was already generated earlier that day. Only links recorded on one of the preceding seven calendar days are suppressed. Failed runs do not mark items as seen, and the first run after upgrading also scans dated digest files from prior days on the Desktop to avoid repeating their links.
+
+The history path can be overridden with `DIGEST_HISTORY_FILE` in `.env`. To intentionally reset the history, delete `.digest_history.json` while the script is not running.
 
 ## Requirements
 
