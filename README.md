@@ -15,6 +15,8 @@
 
 For each source, the digest ranks eligible items using engagement metadata exposed by that source—such as reactions, comments, likes, downloads, or trending score—and uses publication recency as the fallback. It then selects up to two items that have not appeared during the preceding seven calendar days. The Hugging Face section gives a short explanation of each selected model and includes benchmark or evaluation details only when the model card supplies them; a trending score is treated as a popularity signal, not an accuracy ranking. An unavailable or malformed source is logged and skipped while the other sources continue processing.
 
+The generated dashboard labels every item by content type, source tier, extraction quality, and publication date. Summaries attribute claims to their source. Research preprints show separate claim, method, evidence, limitations, and plain-English fields. Title-only items are marked as insufficient rather than guessed from, and unsupported numerical claims are omitted. Similar titles and canonical arXiv identifiers are used to remove cross-source duplicates while preferring primary, better-extracted material.
+
 ## Seven-day history
 
 Successful runs record canonical source URLs in `.digest_history.json`. Links recorded today remain eligible, so regenerating today's report produces the best current selection even if it was already generated earlier that day. Only links recorded on one of the preceding seven calendar days are suppressed. Failed runs do not mark items as seen, and the first run after upgrading also scans dated digest files from prior days on the Desktop to avoid repeating their links.
@@ -110,6 +112,8 @@ The wrapper resolves the repository and virtual-environment paths itself, so it 
 - **Cannot reach local Ollama:** open the Ollama app or run `ollama serve` in another terminal.
 - **Model not found:** run `ollama pull llama3.2:3b`, or set `OLLAMA_MODEL` in `.env` to a name reported by `ollama list`.
 - **No feed entries:** verify internet access. Individual feed failures are warnings; the run stops only if all feeds fail.
+- **Low evidence or insufficient content:** the source exposed only metadata, an RSS snippet, or a title. The dashboard labels this rather than allowing the model to fill in missing facts.
+- **Ollama summary failure:** the report still renders using attributed source excerpts, and the failure is recorded as a warning in the log.
 - **Dashboard says it cannot load the renderer:** reconnect to the internet and reload the HTML file so the CDN scripts can load.
 
 The local inference call follows Ollama's official [`POST /api/chat`](https://docs.ollama.com/api/chat) interface with streaming disabled. Ollama's local API does not require authentication.
