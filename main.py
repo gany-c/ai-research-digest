@@ -11,9 +11,11 @@ import os
 import re
 import socket
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -40,10 +42,16 @@ ARTICLES_PER_SOURCE = 2
 GENERAL_FEED_SCAN_LIMIT = 40
 HISTORY_DAYS = 7
 HUGGINGFACE_MODEL_CANDIDATES = 12
+FETCH_WORKERS = 6
+DEFAULT_OLLAMA_WORKERS = 2
+MAX_OLLAMA_WORKERS = 4
 HUGGINGFACE_MODELS_URL = "https://huggingface.co/api/models?sort=trendingScore&direction=-1&limit=12&full=true"
 REQUEST_TIMEOUT_SECONDS = 15
 OLLAMA_TIMEOUT_SECONDS = 300
-USER_AGENT = "ai-research-digest/2.0 (+local RSS reader)"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+)
 
 SOURCE_PROFILES = {
     "OpenAI": ("Company announcement", "primary"),
@@ -104,14 +112,38 @@ class MetadataExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
         self.descriptions: list[str] = []
+        self.body_parts: list[str] = []
+        self.focused_parts: list[str] = []
+        self.ignore_depth = 0
+        self.focus_depth = 0
+
+    IGNORED_TAGS = {"script", "style", "nav", "header", "footer", "form", "svg", "noscript", "aside"}
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.casefold() != "meta":
+        tag = tag.casefold()
+        if tag == "meta":
+            values = {key.casefold(): value or "" for key, value in attrs}
+            field = (values.get("name") or values.get("property") or "").casefold()
+            if field in {"description", "og:description", "twitter:description"} and values.get("content"):
+                self.descriptions.append(values["content"])
+        if tag in self.IGNORED_TAGS:
+            self.ignore_depth += 1
+        elif not self.ignore_depth and tag in {"article", "main"}:
+            self.focus_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if tag in self.IGNORED_TAGS and self.ignore_depth:
+            self.ignore_depth -= 1
+        elif not self.ignore_depth and tag in {"article", "main"} and self.focus_depth:
+            self.focus_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self.ignore_depth or not data.strip():
             return
-        values = {key.casefold(): value or "" for key, value in attrs}
-        field = (values.get("name") or values.get("property")).casefold()
-        if field in {"description", "og:description", "twitter:description"} and values.get("content"):
-            self.descriptions.append(values["content"])
+        self.body_parts.append(data)
+        if self.focus_depth:
+            self.focused_parts.append(data)
 
 
 def plain_text(value: Any) -> str:
@@ -291,23 +323,58 @@ def deduplicate_articles(articles: list["Article"]) -> list["Article"]:
     return sorted(selected, key=lambda article: original_order[id(article)])
 
 
-def fetch_article_description(url: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> str:
+def compact_page_text(parts: list[str], minimum: int) -> str:
+    text = re.sub(r"\s+", " ", html.unescape(" ".join(parts))).strip()
+    if len(text) < minimum:
+        return ""
+    if len(text) <= 12_000:
+        return text
+    return text[:12_000].rsplit(" ", 1)[0] + "…"
+
+
+def fetch_article_material(url: str, timeout: int = REQUEST_TIMEOUT_SECONDS) -> tuple[str, str]:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in {"http", "https"}:
-        return ""
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
+        return "", ""
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            content_type = str(response.headers.get("Content-Type", "")).casefold()
+            if content_type and not any(allowed in content_type for allowed in ("text/html", "application/xhtml+xml", "text/plain")):
+                return "", ""
             page = response.read(1_500_000).decode("utf-8", errors="replace")
     except (urllib.error.URLError, TimeoutError, socket.timeout, OSError):
-        return ""
+        return "", ""
     extractor = MetadataExtractor()
     try:
         extractor.feed(page)
         extractor.close()
     except Exception:
-        return ""
-    return plain_text(extractor.descriptions[0]) if extractor.descriptions else ""
+        return "", ""
+    description = plain_text(extractor.descriptions[0]) if extractor.descriptions else ""
+    focused = compact_page_text(extractor.focused_parts, minimum=200)
+    body = compact_page_text(extractor.body_parts, minimum=400)
+    return description, focused or body
+
+
+def is_useful_description(text: str) -> bool:
+    if len(text) < 60:
+        return False
+    generic_phrases = (
+        "ai safety and research company",
+        "advance and democratize artificial intelligence",
+        "welcome to our website",
+        "enable javascript",
+    )
+    lowered = text.casefold()
+    return not any(phrase in lowered for phrase in generic_phrases)
 
 
 @dataclass(frozen=True)
@@ -328,6 +395,8 @@ class Article:
 
 def fetch_feed(source: str, url: str, seen_urls: set[str], timeout: int = REQUEST_TIMEOUT_SECONDS) -> tuple[list[Article], str]:
     """Download and parse one RSS/Atom feed, returning at most two entries."""
+    started = time.monotonic()
+    logging.info("Fetching %s feed", source)
     request = urllib.request.Request(
         url,
         headers={"User-Agent": USER_AGENT, "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"},
@@ -361,14 +430,23 @@ def fetch_feed(source: str, url: str, seen_urls: set[str], timeout: int = REQUES
             continue
         published = plain_text(entry.get("published", entry.get("updated", "Date unavailable")))
         feed_text = plain_text(entry.get("summary", entry.get("description", "")))
-        page_description = "" if source == "arXiv AI" else fetch_article_description(link)
-        source_text = feed_text if source == "arXiv AI" else (page_description or feed_text)
-        extraction_quality = (
-            "abstract" if source == "arXiv AI" and feed_text else
-            "page_metadata" if page_description else
-            "rss_summary" if feed_text else
-            "title_only"
-        )
+        if source == "arXiv AI":
+            source_text, extraction_quality = (feed_text, "abstract") if feed_text else ("", "title_only")
+        else:
+            logging.info("%s: extracting page content for %s", source, title)
+            page_description, page_content = fetch_article_material(link)
+            if is_useful_description(feed_text):
+                source_text, extraction_quality = feed_text, "rss_summary"
+            elif is_useful_description(page_description):
+                source_text, extraction_quality = page_description, "page_metadata"
+            elif page_content:
+                source_text, extraction_quality = page_content, "full_content"
+            elif feed_text:
+                source_text, extraction_quality = feed_text, "rss_summary"
+            elif page_description:
+                source_text, extraction_quality = page_description, "page_metadata"
+            else:
+                source_text, extraction_quality = "", "title_only"
         content_type, source_tier = SOURCE_PROFILES.get(source, ("News report", "secondary"))
         popularity, recency = entry_rank(entry)
         articles.append(
@@ -389,10 +467,14 @@ def fetch_feed(source: str, url: str, seen_urls: set[str], timeout: int = REQUES
         )
         if len(articles) >= ARTICLES_PER_SOURCE:
             break
-    return articles, "ok" if articles else "no new eligible items"
+    status = "ok" if articles else "no new eligible items"
+    logging.info("Finished %s: %d item(s), %s, %.1fs", source, len(articles), status, time.monotonic() - started)
+    return articles, status
 
 
 def fetch_huggingface_models(seen_urls: set[str]) -> tuple[list[Article], str]:
+    started = time.monotonic()
+    logging.info("Fetching Hugging Face model metadata")
     request = urllib.request.Request(HUGGINGFACE_MODELS_URL, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
@@ -422,6 +504,7 @@ def fetch_huggingface_models(seen_urls: set[str]) -> tuple[list[Article], str]:
         card_url = f"https://huggingface.co/{urllib.parse.quote(model_id, safe='/')}/raw/main/README.md"
         card_excerpt = ""
         try:
+            logging.info("Hugging Face Models: fetching model card for %s", model_id)
             card_request = urllib.request.Request(card_url, headers={"User-Agent": USER_AGENT, "Accept": "text/plain"})
             with urllib.request.urlopen(card_request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
                 card_excerpt = response.read(8_000).decode("utf-8", errors="replace")
@@ -454,24 +537,44 @@ def fetch_huggingface_models(seen_urls: set[str]) -> tuple[list[Article], str]:
         )
         if len(articles) >= ARTICLES_PER_SOURCE:
             break
-    return articles, "ok" if articles else "no new eligible items"
+    status = "ok" if articles else "no new eligible items"
+    logging.info("Finished Hugging Face Models: %d item(s), %s, %.1fs", len(articles), status, time.monotonic() - started)
+    return articles, status
 
 
 def fetch_all_feeds(seen_urls: set[str]) -> tuple[list[Article], list[str]]:
     articles: list[Article] = []
     source_notes: list[str] = []
-    for source, url in FEEDS.items():
-        source_articles, status = fetch_feed(source, url, seen_urls)
-        if source_articles:
-            articles.extend(source_articles)
-        if status != "ok":
-            source_notes.append(f"{source}: {status}")
-    model_articles, status = fetch_huggingface_models(seen_urls)
+    logging.info("Starting concurrent retrieval for %d sources with %d workers", len(FEEDS) + 1, FETCH_WORKERS)
+    feed_futures: dict[str, Future[tuple[list[Article], str]]] = {}
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS, thread_name_prefix="digest-fetch") as executor:
+        for source, url in FEEDS.items():
+            feed_futures[source] = executor.submit(fetch_feed, source, url, seen_urls)
+        model_future = executor.submit(fetch_huggingface_models, seen_urls)
+
+        # Resolve in configured order so concurrency never changes dashboard order.
+        for source in FEEDS:
+            try:
+                source_articles, status = feed_futures[source].result()
+            except Exception as exc:
+                logging.exception("Unexpected retrieval failure for %s", source)
+                source_articles, status = [], f"unexpected retrieval error ({type(exc).__name__})"
+            if source_articles:
+                articles.extend(source_articles)
+            if status != "ok":
+                source_notes.append(f"{source}: {status}")
+        try:
+            model_articles, status = model_future.result()
+        except Exception as exc:
+            logging.exception("Unexpected retrieval failure for Hugging Face Models")
+            model_articles, status = [], f"unexpected retrieval error ({type(exc).__name__})"
     if model_articles:
         articles.extend(model_articles)
     if status != "ok":
         source_notes.append(f"Hugging Face Models: {status}")
-    return deduplicate_articles(articles), source_notes
+    deduplicated = deduplicate_articles(articles)
+    logging.info("Retrieval complete: %d candidate(s), %d after deduplication", len(articles), len(deduplicated))
+    return deduplicated, source_notes
 
 
 def build_user_prompt(articles: list[Article], unavailable: list[str]) -> str:
@@ -504,7 +607,13 @@ def local_ollama_url() -> str:
 
 def call_ollama(messages: list[dict[str, str]], json_mode: bool = False) -> str:
     model = os.getenv("OLLAMA_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    body: dict[str, Any] = {"model": model, "messages": messages, "stream": False, "think": False, "options": {"temperature": 0.1}}
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "think": False,
+        "options": {"temperature": 0.1, "num_ctx": 8192},
+    }
     if json_mode:
         body["format"] = "json"
     payload = json.dumps(body).encode("utf-8")
@@ -533,21 +642,97 @@ def call_ollama(messages: list[dict[str, str]], json_mode: bool = False) -> str:
     return content
 
 
-def synthesize_digest(articles: list[Article], unavailable: list[str]) -> dict[str, Any]:
-    """Use local Ollama while allowing individual content gaps to degrade safely."""
+def ollama_worker_count() -> int:
+    try:
+        requested = int(os.getenv("OLLAMA_WORKERS", str(DEFAULT_OLLAMA_WORKERS)))
+    except ValueError:
+        logging.warning("Invalid OLLAMA_WORKERS value; using %d", DEFAULT_OLLAMA_WORKERS)
+        requested = DEFAULT_OLLAMA_WORKERS
+    return max(1, min(requested, MAX_OLLAMA_WORKERS))
+
+
+def summarize_article(index: int, article: Article, total: int) -> dict[str, Any] | None:
+    started = time.monotonic()
+    logging.info("[%d/%d] Summarizing with Ollama: %s", index + 1, total, article.title)
+    prompt = {
+        "title": article.title,
+        "publisher": article.source,
+        "content_type": article.content_type,
+        "source_tier": article.source_tier,
+        "extraction_quality": article.extraction_quality,
+        "source_text": article.source_text[:6_000],
+    }
+    instructions = (
+        "Return one JSON object with summary, main_claim, method, evidence, limitations, and lay_explanation. "
+        "Write a concise paraphrase under 55 words, not a copy of the opening sentences. Attribute claims to the "
+        "publisher, authors, or model card. Do not add facts or numbers absent from source_text. For a research "
+        "preprint, fill every field and explain it cautiously for a non-technical adult. For other content, method "
+        "and lay_explanation may be empty. Mention when evidence is company-reported, preliminary, or unclear."
+    )
     try:
         content = call_ollama(
-            [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": build_user_prompt(articles, unavailable)}],
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": instructions + "\n\n" + json.dumps(prompt, ensure_ascii=False)},
+            ],
             json_mode=True,
         )
-        digest = json.loads(content)
-    except (RuntimeError, json.JSONDecodeError) as exc:
-        logging.warning("Ollama synthesis failed; using source-grounded fallbacks: %s", exc)
-        return {"executive_summary": "AI updates selected from the available sources.", "article_summaries": [], "glossary": []}
-    if not isinstance(digest, dict):
-        logging.warning("Ollama returned an unexpected structure; using fallbacks.")
-        return {"executive_summary": "AI updates selected from the available sources.", "article_summaries": [], "glossary": []}
-    return digest
+        item = json.loads(content)
+        if not isinstance(item, dict) or not plain_text(item.get("summary")):
+            raise ValueError("response did not contain a summary")
+        item["index"] = index
+        logging.info("[%d/%d] Summary complete in %.1fs", index + 1, total, time.monotonic() - started)
+        return item
+    except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        logging.warning("[%d/%d] Summary failed after %.1fs for %s: %s", index + 1, total, time.monotonic() - started, article.link, exc)
+        return None
+
+
+def synthesize_digest(articles: list[Article], unavailable: list[str]) -> dict[str, Any]:
+    """Summarize articles with bounded parallel Ollama requests and deterministic output order."""
+    workers = ollama_worker_count()
+    eligible = [(index, article) for index, article in enumerate(articles) if article.extraction_quality != "title_only"]
+    for index, article in enumerate(articles):
+        if article.extraction_quality == "title_only":
+            logging.info("[%d/%d] Skipping title-only item: %s", index + 1, len(articles), article.title)
+    logging.info("Starting Ollama summarization for %d article(s) with %d worker(s)", len(eligible), workers)
+    summaries_by_index: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ollama") as executor:
+        futures = {
+            index: executor.submit(summarize_article, index, article, len(articles))
+            for index, article in eligible
+        }
+        for index, future in futures.items():
+            item = future.result()
+            if item is not None:
+                summaries_by_index[index] = item
+    article_summaries = [summaries_by_index[index] for index in sorted(summaries_by_index)]
+
+    overview_source = [
+        {"title": articles[item["index"]].title, "summary": plain_text(item.get("summary"))}
+        for item in article_summaries
+    ]
+    executive_summary = "Today's selected AI and technology updates."
+    if overview_source:
+        try:
+            started = time.monotonic()
+            logging.info("Generating executive overview from %d completed summaries", len(overview_source))
+            executive_summary = call_ollama(
+                [
+                    {"role": "system", "content": "Write a factual two-sentence overview using only the supplied summaries. Do not add claims or numbers."},
+                    {"role": "user", "content": json.dumps(overview_source, ensure_ascii=False)},
+                ]
+            )
+            executive_summary = re.sub(
+                r"^Here (?:is|are) (?:a |the )?(?:brief |two-sentence )?overview(?: of the summaries provided)?\s*:\s*",
+                "",
+                executive_summary,
+                flags=re.IGNORECASE,
+            )
+            logging.info("Executive overview complete in %.1fs", time.monotonic() - started)
+        except RuntimeError as exc:
+            logging.warning("Executive summary failed; using the default overview: %s", exc)
+    return {"executive_summary": executive_summary, "article_summaries": article_summaries, "glossary": []}
 
 
 def fallback_summary(article: Article) -> str:
@@ -586,7 +771,7 @@ def ensure_attribution(text: str, article: Article) -> str:
         "Model card": "The model card reports that ",
         "Company announcement": f"{article.source} says that ",
     }.get(article.content_type, f"{article.source} reports that ")
-    return prefix + text[0].lower() + text[1:] if text else text
+    return prefix + text if text else text
 
 
 def normalized_digest(raw: dict[str, Any], articles: list[Article]) -> tuple[str, dict[int, dict[str, str]], list[tuple[str, str]]]:
@@ -696,11 +881,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
     load_dotenv()
     args = parse_args()
 
+    logging.info("AI Research Digest started")
     recent_history = load_recent_history()
+    logging.info("Loaded %d URL(s) seen during previous days", len(recent_history))
     articles, unavailable = fetch_all_feeds(set(recent_history))
     if not articles:
         logging.info("No new articles or models were found that had not appeared in the previous %d days.", HISTORY_DAYS)
@@ -711,8 +902,10 @@ def main() -> int:
         date_stamp = datetime.now().astimezone().strftime("%Y-%m-%d")
         default_output = Path(os.path.expanduser("~")) / "Desktop" / f"ai_research_digest_{date_stamp}.html"
         output_path = (args.output or default_output).expanduser().resolve()
+        logging.info("Rendering %d article(s) to %s", len(articles), output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(render_html(digest, articles, unavailable), encoding="utf-8")
+        logging.info("HTML output saved; updating seven-day history")
         save_history(recent_history, articles)
     except Exception as exc:
         logging.error("Digest generation failed: %s", exc)

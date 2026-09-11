@@ -15,7 +15,9 @@
 
 For each source, the digest ranks eligible items using engagement metadata exposed by that source—such as reactions, comments, likes, downloads, or trending score—and uses publication recency as the fallback. It then selects up to two items that have not appeared during the preceding seven calendar days. The Hugging Face section gives a short explanation of each selected model and includes benchmark or evaluation details only when the model card supplies them; a trending score is treated as a popularity signal, not an accuracy ranking. An unavailable or malformed source is logged and skipped while the other sources continue processing.
 
-The generated dashboard labels every item by content type, source tier, extraction quality, and publication date. Summaries attribute claims to their source. Research preprints show separate claim, method, evidence, limitations, and plain-English fields. Title-only items are marked as insufficient rather than guessed from, and unsupported numerical claims are omitted. Similar titles and canonical arXiv identifiers are used to remove cross-source duplicates while preferring primary, better-extracted material.
+RSS feeds and Hugging Face metadata are retrieved concurrently with a bounded six-thread pool. Results are restored to the configured source order before deduplication and rendering. Ollama summaries use a separate, configurable two-worker pool and are restored to article order before rendering.
+
+The generated dashboard labels every item by content type, source tier, extraction quality, and publication date. Each article is summarized in a separate, bounded Ollama request so long page extracts cannot crowd other articles out of the response. Summaries attribute claims to their source. Research preprints show separate claim, method, evidence, limitations, and plain-English fields. Source material is selected in this order: arXiv abstract, useful RSS description, useful page metadata, then cleaned article/main page content. Generic site-wide descriptions are rejected as article metadata. Only pages with too little usable text remain marked as insufficient. Unsupported numerical claims are omitted. Similar titles and canonical arXiv identifiers are used to remove cross-source duplicates while preferring primary, better-extracted material.
 
 ## Seven-day history
 
@@ -59,9 +61,10 @@ The default `.env` configuration is:
 ```dotenv
 OLLAMA_MODEL=llama3.2:3b
 OLLAMA_URL=http://127.0.0.1:11434
+OLLAMA_WORKERS=2
 ```
 
-You can replace `llama3.2:3b` with any model shown by `ollama list`. The application permits only loopback Ollama URLs, ensuring prompts stay on this computer. Do not commit `.env`; it is excluded by `.gitignore`.
+You can replace `llama3.2:3b` with any model shown by `ollama list`. `OLLAMA_WORKERS` controls concurrent summary requests and is limited to 1–4; the conservative default is 2. Reduce it to 1 if the computer experiences memory pressure. The application permits only loopback Ollama URLs, ensuring prompts stay on this computer. Do not commit `.env`; it is excluded by `.gitignore`.
 
 ## Run
 
@@ -82,6 +85,8 @@ python main.py --output ./ai_research_digest.html
 ```
 
 Open the generated file in a web browser. The dated default name preserves earlier daily digests. An explicit `--output` path is replaced when reused.
+
+The console prints timestamped progress for feed retrieval, page extraction, each Ollama summary, overview generation, HTML writing, and history updates. Ollama entries include an `[item/total]` counter and elapsed time, making a slow source or model request visible rather than appearing to hang.
 
 ## Daily cron job (macOS or Linux)
 

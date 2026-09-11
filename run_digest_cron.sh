@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"
 OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
 OLLAMA_LOG="${OLLAMA_LOG:-$SCRIPT_DIR/ollama-cron.log}"
+OLLAMA_PARALLEL="${OLLAMA_NUM_PARALLEL:-${OLLAMA_WORKERS:-2}}"
 STARTED_OLLAMA=0
 OLLAMA_PID=""
 
@@ -73,7 +74,8 @@ else
         exit 1
     fi
 
-    log "Starting Ollama with $OLLAMA_EXECUTABLE"
+    export OLLAMA_NUM_PARALLEL="$OLLAMA_PARALLEL"
+    log "Starting Ollama with $OLLAMA_EXECUTABLE (parallel requests: $OLLAMA_NUM_PARALLEL)"
     "$OLLAMA_EXECUTABLE" serve >>"$OLLAMA_LOG" 2>&1 &
     OLLAMA_PID=$!
     STARTED_OLLAMA=1
